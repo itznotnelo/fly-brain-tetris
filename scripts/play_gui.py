@@ -35,9 +35,9 @@ from brian2 import SpikeMonitor, ms, mV
 
 from data_loader import load_full_dataset
 from network import build_lif_network
-from encode import build_input_assignment, encode_board_to_current
+from encode import build_input_assignment, encode_state_to_current
 from decode import decode_action, flatten_readout, unflatten_readout, N_ACTIONS
-from tetris_env import TetrisEnv, INDEX_TO_PIECE
+from tetris_env import TetrisEnv, INDEX_TO_PIECE, PIECE_SHAPES
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_READOUT = ROOT / "results" / "stage4_best_readout.npz"
@@ -92,6 +92,24 @@ def draw_board(screen, env, cell_size, origin):
                 pygame.draw.rect(screen, GRID_COLOR, rect, width=1)
 
 
+def draw_next_piece_preview(screen, ox, y, piece_name, cell=14):
+    """Draws a small 4x4-cell preview of the upcoming piece and returns the
+    y-coordinate just below it."""
+    box_h = cell * 3
+    box_rect = pygame.Rect(ox, y, cell * 4, box_h)
+    pygame.draw.rect(screen, EMPTY_COLOR, box_rect)
+    pygame.draw.rect(screen, GRID_COLOR, box_rect, width=1)
+
+    if piece_name:
+        color = PIECE_COLORS.get(piece_name, (200, 200, 200))
+        for dr, dc in PIECE_SHAPES[piece_name]:
+            rect = pygame.Rect(ox + dc * cell, y + dr * cell, cell, cell)
+            pygame.draw.rect(screen, color, rect)
+            pygame.draw.rect(screen, BG_COLOR, rect, width=1)
+
+    return y + box_h + 10
+
+
 def draw_sidebar(screen, font, small_font, origin, width, stats, logits):
     ox, oy = origin
     y = oy
@@ -112,6 +130,12 @@ def draw_sidebar(screen, font, small_font, origin, width, stats, logits):
         surf = small_font.render(line, True, TEXT_COLOR)
         screen.blit(surf, (ox, y))
         y += 22
+
+    y += 6
+    surf = small_font.render("next piece (fed to the reservoir too):", True, TEXT_COLOR)
+    screen.blit(surf, (ox, y))
+    y += 20
+    y = draw_next_piece_preview(screen, ox, y, stats["next_piece"])
 
     if stats["new_high_score_flash"]:
         flash = font.render("NEW HIGH SCORE!", True, HIGH_SCORE_COLOR)
@@ -178,7 +202,9 @@ class EpisodeRunner:
         if self.done or self.ticks >= self.max_ticks:
             return False
 
-        currents = encode_board_to_current(self.n, self.obs, self.input_groups, self.rng)
+        currents = encode_state_to_current(
+            self.n, self.obs, self.env.next_piece_name, self.input_groups, self.rng
+        )
         self.G.I = currents * mV
         self.net.run(self.decision_window_ms * ms)
 
@@ -250,13 +276,16 @@ def main():
     solutions = es.ask()
     fitnesses = []
     individual_idx = 0
-    episode_seed_counter = 0
+    # Same episode seed (piece sequence, network noise) for every individual
+    # within a generation, varying only across generations — otherwise
+    # "who got an easier piece sequence" swamps "whose readout is better."
+    episode_seed = args.seed + generation
 
     def new_runner(flat_params, seed):
         W, b = unflatten_readout(flat_params, N_ACTIONS, n_output)
         return EpisodeRunner(graph, sensory_ids, dn_ids, W, b, seed, args.max_ticks, args.decision_window_ms)
 
-    runner = new_runner(solutions[individual_idx], episode_seed_counter)
+    runner = new_runner(solutions[individual_idx], episode_seed)
 
     running = True
     print("Starting continuous train+play loop. Close the window or press ESC to quit.")
@@ -281,10 +310,9 @@ def main():
                 print(f"New high score: {high_score:+.3f} (gen {generation}, individual {individual_idx})")
 
             individual_idx += 1
-            episode_seed_counter += 1
 
             if individual_idx < len(solutions):
-                runner = new_runner(solutions[individual_idx], episode_seed_counter)
+                runner = new_runner(solutions[individual_idx], episode_seed)
             else:
                 es.tell(solutions, fitnesses)
                 best_gen = -min(fitnesses)
@@ -292,10 +320,11 @@ def main():
                 print(f"generation {generation:4d} complete — best={best_gen:+.3f} mean={mean_gen:+.3f} "
                       f"high_score={high_score:+.3f}")
                 generation += 1
+                episode_seed = args.seed + generation
                 solutions = es.ask()
                 fitnesses = []
                 individual_idx = 0
-                runner = new_runner(solutions[individual_idx], episode_seed_counter)
+                runner = new_runner(solutions[individual_idx], episode_seed)
 
         if high_score_flash_ticks > 0:
             high_score_flash_ticks -= 1
@@ -310,6 +339,7 @@ def main():
             "action": runner.last_action,
             "high_score": high_score,
             "new_high_score_flash": high_score_flash_ticks > 0,
+            "next_piece": runner.env.next_piece_name,
         }
 
         screen.fill(BG_COLOR)

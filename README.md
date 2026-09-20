@@ -56,7 +56,10 @@ directly.
    The `sensory` class here spans many real modalities (olfactory,
    gustatory, thermosensory, mechanosensory, some visual) and is used purely
    as a generic pool of input channels driven by board-cell occupancy — not
-   as a model of fly eyesight. See `encode.py`.
+   as a model of fly eyesight. The agent also gets a **one-piece lookahead**:
+   the upcoming piece's identity is one-hot encoded into 7 extra input
+   channels alongside the 72 board-cell channels, so it isn't purely
+   reactive to the piece already falling. See `encode.py` / `tetris_env.py`.
 3. **Decision window and board size are simulation conveniences**, not
    biological timescales: a 6×12 board and a 20ms decision window per tick
    were chosen for tractability on a CPU-only, no-C-compiler machine, not
@@ -67,6 +70,14 @@ directly.
    connectome beats the random control. Run `scripts/stage5_comparison.py`
    with larger `GENERATIONS`/`POPSIZE` (and ideally multiple random seeds per
    condition) for anything more conclusive.
+5. **Evaluation seeding**: every individual within one CMA-ES generation is
+   evaluated on the *same* piece sequence and network noise trajectory
+   (only the generation-to-generation seed changes) — this was a deliberate
+   fix so the fitness signal reflects "whose readout is better," not "who
+   got an easier piece sequence." Early evidence this helped: within a
+   single generation, best-individual and population-mean reward now come
+   out nearly identical, as expected when the only thing varying is the
+   readout weights.
 
 ## Setup
 

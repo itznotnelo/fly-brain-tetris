@@ -62,6 +62,10 @@ _SHAPE_NAMES = list(_SHAPE_ROTATIONS.keys())
 PIECE_INDEX = {name: i + 1 for i, name in enumerate(_SHAPE_NAMES)}
 INDEX_TO_PIECE = {v: k for k, v in PIECE_INDEX.items()}
 
+# Public alias so a GUI can draw a next-piece preview using each shape's
+# base (rotation 0) cell layout, without reaching into a private name.
+PIECE_SHAPES = _BASE_SHAPES
+
 
 class TetrisEnv:
     def __init__(self, width: int = WIDTH, height: int = HEIGHT, seed: int | None = None):
@@ -70,6 +74,7 @@ class TetrisEnv:
         self.rng = np.random.default_rng(seed)
         self.board = None
         self.piece_name = None
+        self.next_piece_name = None
         self.rotation_idx = None
         self.piece_row = None
         self.piece_col = None
@@ -79,11 +84,19 @@ class TetrisEnv:
     def reset(self):
         self.board = np.zeros((self.height, self.width), dtype=np.uint8)
         self.done = False
+        self.next_piece_name = self._random_piece_name()
         self._spawn_piece()
         return self._obs()
 
+    def _random_piece_name(self):
+        return _SHAPE_NAMES[self.rng.integers(0, len(_SHAPE_NAMES))]
+
     def _spawn_piece(self):
-        self.piece_name = _SHAPE_NAMES[self.rng.integers(0, len(_SHAPE_NAMES))]
+        # One-piece lookahead: promote the previewed piece to current, then
+        # draw a new one to preview. Lets the agent see what's coming next,
+        # not just react to the piece already falling.
+        self.piece_name = self.next_piece_name
+        self.next_piece_name = self._random_piece_name()
         self.rotation_idx = 0
         cells = _SHAPE_ROTATIONS[self.piece_name][0]
         max_col = max(c for _, c in cells)

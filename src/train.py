@@ -9,7 +9,7 @@ import numpy as np
 from brian2 import SpikeMonitor, ms, mV
 
 from network import build_lif_network
-from encode import build_input_assignment, encode_board_to_current
+from encode import build_input_assignment, encode_state_to_current
 from decode import decode_action, init_random_readout, unflatten_readout, N_ACTIONS
 from tetris_env import TetrisEnv
 
@@ -53,7 +53,7 @@ def run_episode(
     done = False
 
     while not done and ticks < max_ticks:
-        currents = encode_board_to_current(n, obs, input_groups, rng)
+        currents = encode_state_to_current(n, obs, env.next_piece_name, input_groups, rng)
         G.I = currents * mV
         net.run(decision_window_ms * ms)
 
@@ -151,7 +151,13 @@ def train_cma(
     ) as pool:
         for gen in range(generations):
             solutions = es.ask()
-            args = [(sol, gen * 10_000 + i, n_actions) for i, sol in enumerate(solutions)]
+            # Same episode seed (piece sequence, network build noise, encode
+            # noise) for every individual THIS generation, varying only
+            # across generations — otherwise CMA-ES partly rewards "who got
+            # an easier piece sequence" rather than "whose readout is
+            # better," which was swamping the fitness signal.
+            episode_seed = seed + gen
+            args = [(sol, episode_seed, n_actions) for sol in solutions]
             fitnesses = pool.map(_worker_fitness, args)
             es.tell(solutions, fitnesses)
 
