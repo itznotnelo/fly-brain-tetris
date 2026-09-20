@@ -1,14 +1,24 @@
-"""Visual GUI: watch the real fly-larva connectome reservoir play Tetris in
-real time, with a live view of the trained readout's action logits (i.e.
-what the "brain" is currently leaning toward).
+"""Visual GUI: the real fly-larva connectome reservoir plays Tetris
+continuously and trains itself as it goes. Each episode played is one CMA-ES
+individual; once a full population of episodes has been played, the readout
+weights update (CMA-ES tell/ask) and the next generation starts automatically
+— it just keeps playing, generation after generation, forever. Whenever an
+episode beats the running high score, that readout is saved to disk.
+
+Only the small linear readout is ever trained — the connectome-derived
+recurrent reservoir itself is fixed, per the project's reservoir-computing
+design (see README.md).
 
 Run: python scripts/play_gui.py
 Options:
-  --readout PATH     .npz with W,b (default: results/stage4_best_readout.npz)
-  --random            ignore any saved readout, use a fresh random one
-  --max-ticks N       episode length cap (default 300)
-  --decision-window-ms N   simulated ms per tick (default 20)
-  --cell-size N       pixel size per board cell (default 32)
+  --readout PATH        .npz with W,b to warm-start CMA-ES from
+                         (default: results/stage4_best_readout.npz)
+  --fresh                ignore any saved readout, start from scratch
+  --popsize N            episodes (individuals) per generation (default 8)
+  --sigma0 N              CMA-ES initial step size (default 0.05)
+  --max-ticks N          episode length cap (default 200)
+  --decision-window-ms N  simulated ms per tick (default 20)
+  --cell-size N          pixel size per board cell (default 32)
 
 Controls: ESC or close window to quit.
 """
@@ -20,16 +30,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import numpy as np
 import pygame
+import cma
 from brian2 import SpikeMonitor, ms, mV
 
 from data_loader import load_full_dataset
 from network import build_lif_network
 from encode import build_input_assignment, encode_board_to_current
-from decode import decode_action, init_random_readout
-from tetris_env import TetrisEnv, INDEX_TO_PIECE, N_ACTIONS
+from decode import decode_action, flatten_readout, unflatten_readout, N_ACTIONS
+from tetris_env import TetrisEnv, INDEX_TO_PIECE
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_READOUT = ROOT / "results" / "stage4_best_readout.npz"
+HIGH_SCORE_READOUT = ROOT / "results" / "gui_high_score_readout.npz"
 
 PIECE_COLORS = {
     "I": (0, 240, 240),
@@ -44,29 +56,23 @@ BG_COLOR = (18, 18, 24)
 GRID_COLOR = (50, 50, 60)
 EMPTY_COLOR = (30, 30, 38)
 TEXT_COLOR = (230, 230, 235)
+HIGH_SCORE_COLOR = (255, 215, 0)
 ACTION_NAMES = ["noop", "left", "right", "rotate", "drop"]
 ACTION_BAR_COLOR = (90, 160, 240)
 ACTION_BAR_ACTIVE = (240, 200, 60)
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Fly connectome plays Tetris — live GUI")
+    p = argparse.ArgumentParser(description="Fly connectome trains and plays Tetris, forever — live GUI")
     p.add_argument("--readout", type=str, default=str(DEFAULT_READOUT))
-    p.add_argument("--random", action="store_true")
-    p.add_argument("--max-ticks", type=int, default=300)
+    p.add_argument("--fresh", action="store_true")
+    p.add_argument("--popsize", type=int, default=8)
+    p.add_argument("--sigma0", type=float, default=0.05)
+    p.add_argument("--max-ticks", type=int, default=200)
     p.add_argument("--decision-window-ms", type=float, default=20.0)
     p.add_argument("--cell-size", type=int, default=32)
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
-
-
-def load_readout(args, n_output):
-    if not args.random and Path(args.readout).exists():
-        data = np.load(args.readout)
-        print(f"Loaded trained readout from {args.readout}")
-        return data["W"], data["b"]
-    print("Using a fresh random (untrained) readout.")
-    return init_random_readout(n_output_neurons=n_output, seed=args.seed)
 
 
 def draw_board(screen, env, cell_size, origin):
@@ -89,17 +95,28 @@ def draw_board(screen, env, cell_size, origin):
 def draw_sidebar(screen, font, small_font, origin, width, stats, logits):
     ox, oy = origin
     y = oy
+
+    hs_surf = font.render(f"HIGH SCORE: {stats['high_score']:+.3f}", True, HIGH_SCORE_COLOR)
+    screen.blit(hs_surf, (ox, y))
+    y += 32
+
     lines = [
+        f"generation: {stats['generation']}",
+        f"individual: {stats['individual']}/{stats['popsize']}",
         f"tick: {stats['tick']}",
-        f"reward (this tick): {stats['reward']:+.3f}",
-        f"total reward: {stats['total_reward']:+.3f}",
+        f"episode reward: {stats['total_reward']:+.3f}",
         f"lines cleared: {stats['lines_cleared']}",
         f"last action: {ACTION_NAMES[stats['action']]}",
     ]
     for line in lines:
-        surf = font.render(line, True, TEXT_COLOR)
+        surf = small_font.render(line, True, TEXT_COLOR)
         screen.blit(surf, (ox, y))
-        y += 26
+        y += 22
+
+    if stats["new_high_score_flash"]:
+        flash = font.render("NEW HIGH SCORE!", True, HIGH_SCORE_COLOR)
+        screen.blit(flash, (ox, y))
+        y += 30
 
     y += 10
     surf = small_font.render("readout action logits (DN spike-driven):", True, TEXT_COLOR)
@@ -124,34 +141,97 @@ def draw_sidebar(screen, font, small_font, origin, width, stats, logits):
         y += 22
 
 
+class EpisodeRunner:
+    """Wraps a fresh network + env + readout for exactly one episode. The
+    reservoir is rebuilt each episode (cheap, ~0.1-0.2s) and never trained —
+    only the readout (W, b) passed in changes between episodes."""
+
+    def __init__(self, graph, sensory_ids, dn_ids, W, b, episode_seed, max_ticks, decision_window_ms):
+        self.W = W
+        self.b = b
+        self.max_ticks = max_ticks
+        self.decision_window_ms = decision_window_ms
+
+        self.built = build_lif_network(graph, sensory_ids, dn_ids, seed=episode_seed)
+        self.net = self.built["network"]
+        self.G = self.built["neurons"]
+        self.n = self.built["n_neurons"]
+        self.output_indices = self.built["output_indices"]
+
+        self.env = TetrisEnv(seed=episode_seed)
+        self.obs = self.env.reset()
+        self.input_groups = build_input_assignment(self.built["input_indices"], self.obs.shape, seed=episode_seed)
+
+        self.spikemon = SpikeMonitor(self.G)
+        self.net.add(self.spikemon)
+        self.rng = np.random.default_rng(episode_seed)
+
+        self.prev_spike_count = 0
+        self.total_reward = 0.0
+        self.ticks = 0
+        self.done = False
+        self.last_action = 0
+        self.last_lines = 0
+        self.logits = np.zeros(N_ACTIONS)
+
+    def step_tick(self):
+        if self.done or self.ticks >= self.max_ticks:
+            return False
+
+        currents = encode_board_to_current(self.n, self.obs, self.input_groups, self.rng)
+        self.G.I = currents * mV
+        self.net.run(self.decision_window_ms * ms)
+
+        all_i = np.asarray(self.spikemon.i)
+        new_i = all_i[self.prev_spike_count:]
+        self.prev_spike_count = len(all_i)
+        counts = np.zeros(self.n)
+        if len(new_i):
+            bc = np.bincount(new_i, minlength=self.n)
+            counts[: len(bc)] = bc
+        output_counts = counts[self.output_indices]
+
+        self.logits = self.W @ output_counts + self.b
+        action = decode_action(output_counts, self.W, self.b)
+
+        self.obs, reward, self.done, info = self.env.step(action)
+        self.total_reward += reward
+        self.ticks += 1
+        self.last_action = action
+        self.last_lines = info.get("lines_cleared_this_tick", 0)
+        return True
+
+    def finished(self):
+        return self.done or self.ticks >= self.max_ticks
+
+
 def main():
     args = parse_args()
 
     print("Loading real connectome...")
     graph, ann, sensory_ids, dn_ids = load_full_dataset()
 
-    print("Building Brian2 reservoir...")
-    built = build_lif_network(graph, sensory_ids, dn_ids, seed=args.seed)
-    G = built["neurons"]
-    net = built["network"]
-    n = built["n_neurons"]
-    output_indices = built["output_indices"]
+    print("Sizing readout dimensions...")
+    probe = build_lif_network(graph, sensory_ids, dn_ids, seed=args.seed)
+    n_output = len(probe["output_indices"])
+    n_params = N_ACTIONS * n_output + N_ACTIONS
 
-    W, b = load_readout(args, n_output=len(output_indices))
+    x0 = np.zeros(n_params)
+    if not args.fresh and Path(args.readout).exists():
+        data = np.load(args.readout)
+        x0 = flatten_readout(data["W"], data["b"])
+        print(f"Warm-starting CMA-ES from {args.readout}")
+    else:
+        print("Starting CMA-ES from scratch (zero-mean readout).")
 
-    env = TetrisEnv(seed=args.seed)
-    obs = env.reset()
-    input_groups = build_input_assignment(built["input_indices"], obs.shape, seed=args.seed)
-
-    spikemon = SpikeMonitor(G)
-    net.add(spikemon)
-    rng = np.random.default_rng(args.seed)
+    es = cma.CMAEvolutionStrategy(x0, args.sigma0, {"popsize": args.popsize, "seed": args.seed})
 
     pygame.init()
-    pygame.display.set_caption("Fly Larva Connectome plays Tetris")
+    pygame.display.set_caption("Fly Larva Connectome trains & plays Tetris")
     cell = args.cell_size
-    board_w, board_h = env.width * cell, env.height * cell
-    sidebar_w = 260
+    dummy_env = TetrisEnv()
+    board_w, board_h = dummy_env.width * cell, dummy_env.height * cell
+    sidebar_w = 280
     margin = 20
     win_w = margin * 3 + board_w + sidebar_w
     win_h = margin * 2 + board_h
@@ -163,70 +243,83 @@ def main():
     board_origin = (margin, margin)
     sidebar_origin = (margin * 2 + board_w, margin)
 
-    prev_spike_count = 0
-    total_reward = 0.0
-    ticks = 0
-    stats = {"tick": 0, "reward": 0.0, "total_reward": 0.0, "lines_cleared": 0, "action": 0}
-    logits = np.zeros(N_ACTIONS)
+    high_score = -1e9
+    high_score_flash_ticks = 0
+
+    generation = 0
+    solutions = es.ask()
+    fitnesses = []
+    individual_idx = 0
+    episode_seed_counter = 0
+
+    def new_runner(flat_params, seed):
+        W, b = unflatten_readout(flat_params, N_ACTIONS, n_output)
+        return EpisodeRunner(graph, sensory_ids, dn_ids, W, b, seed, args.max_ticks, args.decision_window_ms)
+
+    runner = new_runner(solutions[individual_idx], episode_seed_counter)
 
     running = True
-    done = False
-    print("Starting GUI loop. Close the window or press ESC to quit.")
+    print("Starting continuous train+play loop. Close the window or press ESC to quit.")
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 running = False
-
         if not running:
             break
 
-        if not done and ticks < args.max_ticks:
-            currents = encode_board_to_current(n, obs, input_groups, rng)
-            G.I = currents * mV
-            net.run(args.decision_window_ms * ms)
+        if not runner.finished():
+            runner.step_tick()
+        else:
+            # Episode over: record fitness, check high score, advance.
+            fitnesses.append(-runner.total_reward)
+            if runner.total_reward > high_score:
+                high_score = runner.total_reward
+                np.savez(HIGH_SCORE_READOUT, W=runner.W, b=runner.b)
+                high_score_flash_ticks = 60  # ~2s at 30fps
+                print(f"New high score: {high_score:+.3f} (gen {generation}, individual {individual_idx})")
 
-            all_i = np.asarray(spikemon.i)
-            new_i = all_i[prev_spike_count:]
-            prev_spike_count = len(all_i)
-            counts = np.zeros(n)
-            if len(new_i):
-                bc = np.bincount(new_i, minlength=n)
-                counts[: len(bc)] = bc
-            output_counts = counts[output_indices]
+            individual_idx += 1
+            episode_seed_counter += 1
 
-            logits = W @ output_counts + b
-            action = decode_action(output_counts, W, b)
+            if individual_idx < len(solutions):
+                runner = new_runner(solutions[individual_idx], episode_seed_counter)
+            else:
+                es.tell(solutions, fitnesses)
+                best_gen = -min(fitnesses)
+                mean_gen = -float(np.mean(fitnesses))
+                print(f"generation {generation:4d} complete — best={best_gen:+.3f} mean={mean_gen:+.3f} "
+                      f"high_score={high_score:+.3f}")
+                generation += 1
+                solutions = es.ask()
+                fitnesses = []
+                individual_idx = 0
+                runner = new_runner(solutions[individual_idx], episode_seed_counter)
 
-            obs, reward, done, info = env.step(action)
-            total_reward += reward
-            ticks += 1
+        if high_score_flash_ticks > 0:
+            high_score_flash_ticks -= 1
 
-            stats = {
-                "tick": ticks,
-                "reward": reward,
-                "total_reward": total_reward,
-                "lines_cleared": info.get("lines_cleared_this_tick", 0),
-                "action": action,
-            }
+        stats = {
+            "generation": generation,
+            "individual": individual_idx + 1,
+            "popsize": len(solutions),
+            "tick": runner.ticks,
+            "total_reward": runner.total_reward,
+            "lines_cleared": runner.last_lines,
+            "action": runner.last_action,
+            "high_score": high_score,
+            "new_high_score_flash": high_score_flash_ticks > 0,
+        }
 
         screen.fill(BG_COLOR)
-        draw_board(screen, env, cell, board_origin)
-        draw_sidebar(screen, font, small_font, sidebar_origin, sidebar_w, stats, logits)
-
-        if done:
-            over = font.render("TOPPED OUT — episode finished", True, (240, 90, 90))
-            screen.blit(over, (margin, win_h - 30))
-        elif ticks >= args.max_ticks:
-            over = font.render("Max ticks reached — episode finished", True, (240, 200, 90))
-            screen.blit(over, (margin, win_h - 30))
-
+        draw_board(screen, runner.env, cell, board_origin)
+        draw_sidebar(screen, font, small_font, sidebar_origin, sidebar_w, stats, runner.logits)
         pygame.display.flip()
         clock.tick(30)
 
     pygame.quit()
-    print(f"\nFinished: {ticks} ticks, total_reward={total_reward:+.3f}")
+    print(f"\nStopped. Final high score: {high_score:+.3f} (saved to {HIGH_SCORE_READOUT})")
 
 
 if __name__ == "__main__":
