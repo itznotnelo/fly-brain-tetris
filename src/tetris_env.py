@@ -5,7 +5,9 @@ the spiking-network reservoir driving it.
 reset() -> obs
 step(action) -> obs, reward, done, info
 
-obs is a (HEIGHT, WIDTH) uint8 numpy array: 1 = occupied cell, 0 = empty.
+obs is a (HEIGHT, WIDTH) uint8 numpy array: 0 = empty, 1-7 = occupied by that
+piece type (see PIECE_INDEX), so a GUI can color-code locked blocks by piece.
+Any nonzero value is still simply "occupied" for encoding/training purposes.
 Actions: 0=noop, 1=left, 2=right, 3=rotate, 4=soft_drop
 """
 from __future__ import annotations
@@ -55,6 +57,10 @@ def _all_rotations(cells):
 
 _SHAPE_ROTATIONS = {name: _all_rotations(cells) for name, cells in _BASE_SHAPES.items()}
 _SHAPE_NAMES = list(_SHAPE_ROTATIONS.keys())
+
+# Nonzero board-cell values so a GUI can color-code locked blocks by piece.
+PIECE_INDEX = {name: i + 1 for i, name in enumerate(_SHAPE_NAMES)}
+INDEX_TO_PIECE = {v: k for k, v in PIECE_INDEX.items()}
 
 
 class TetrisEnv:
@@ -140,10 +146,11 @@ class TetrisEnv:
         return self._obs(), reward, self.done, {"lines_cleared_this_tick": self._last_lines}
 
     def _lock_piece(self, cells):
+        piece_idx = PIECE_INDEX[self.piece_name]
         for dr, dc in cells:
             r, c = self.piece_row + dr, self.piece_col + dc
             if 0 <= r < self.height and 0 <= c < self.width:
-                self.board[r, c] = 1
+                self.board[r, c] = piece_idx
 
     def _clear_lines(self):
         full_rows = [r for r in range(self.height) if self.board[r].all()]
@@ -172,15 +179,16 @@ class TetrisEnv:
     def _obs(self):
         obs = self.board.copy()
         cells = self._current_cells() if not self.done else []
+        piece_idx = PIECE_INDEX[self.piece_name] if self.piece_name else 0
         for dr, dc in cells:
             r, c = self.piece_row + dr, self.piece_col + dc
             if 0 <= r < self.height and 0 <= c < self.width:
-                obs[r, c] = 1
+                obs[r, c] = piece_idx
         return obs
 
     def render_ascii(self) -> str:
         obs = self._obs()
         lines = []
         for row in obs:
-            lines.append("".join("#" if v else "." for v in row))
+            lines.append("".join(INDEX_TO_PIECE.get(v, ".")[0] if v else "." for v in row))
         return "\n".join(lines)

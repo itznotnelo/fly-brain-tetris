@@ -101,6 +101,13 @@ Run in order — each is a standalone verification stage:
 - `scripts/stage5_comparison.py` — trains real-connectome and random-control
   reservoirs with identical hyperparameters, renders a demo episode for
   each, and saves the comparison plot `results/stage5_comparison.png`.
+- `scripts/play_gui.py` — **live pygame GUI**: watch the connectome-driven
+  agent play in real time, with a sidebar showing tick/reward/lines-cleared
+  and a live bar chart of the readout's action logits (what the "brain" is
+  currently leaning toward). Defaults to the trained readout from Stage 4
+  (`results/stage4_best_readout.npz`); pass `--random` to watch an untrained
+  (random readout) agent instead, for comparison. ESC or close the window to
+  quit.
 
 ## Module layout
 
