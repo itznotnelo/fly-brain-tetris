@@ -1,0 +1,6 @@
+brian2
+networkx
+pandas
+cma
+numpy
+matplotlib
